@@ -1,3 +1,5 @@
+import { EbookWorker } from '/assets/ebook1/client.js?v=1';
+import { tidyKindleEpub } from '/assets/ebook1/tidy.js?v=2';
 import { readDoc, docToMarkdown, docToText } from '/assets/doc1/doc-text.js?v=1';
 
 const $ = (id) => document.getElementById(id);
@@ -26,7 +28,43 @@ const OUT = {
   txt: { label: 'Plain text', ext: 'txt', mime: 'text/plain' },
   epub: { label: 'EPUB', ext: 'epub', mime: 'application/epub+zip' },
   fb2: { label: 'FictionBook', ext: 'fb2', mime: 'application/x-fictionbook+xml' },
+  kepub: { label: 'Kobo KEPUB', ext: 'kepub.epub', mime: 'application/epub+zip' },
+  azw3: { label: 'Kindle AZW3', ext: 'azw3', mime: 'application/vnd.amazon.ebook' },
 };
+
+const boko = new EbookWorker('/assets/ebook1/boko/worker.js?v=1', { type: 'module' });
+const kepubify = new EbookWorker('/assets/ebook1/kepubify/worker.js?v=1', { type: 'classic' });
+
+async function runEngine(w, op, bytes, options) {
+  const input = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  const r = await w.convert(op, input, options);
+  if (!r.ok) {
+    const msg = String(r.error || 'conversion failed');
+    if (/drm|encrypt|protected/i.test(msg)) throw new Error(DRM_MESSAGE);
+    if (/timed out/i.test(msg)) throw new Error(msg);
+    if (/I\/O error|invalid range|Could not find|Unknown book type|Not a valid|EOCD|zip|crashed|unexpected end|out of range/i.test(msg)) throw new Error(`the file looks damaged or incomplete, so it could not be read (${msg.replace(/^(Error|I\/O error):\s*/i, '').slice(0, 120)})`);
+    throw new Error(msg.replace(/^Error:\s*/, '').slice(0, 300));
+  }
+  return new Uint8Array(r.output);
+}
+
+async function kindleToEpub(item) {
+  if (item.kind !== 'kindle') return;
+  item.status = `reading ${item.kindLabel}…`;
+  render();
+  const epub = await runEngine(boko, 'boko', item.bytes, { from: item.from, to: 'epub' });
+  const tidy = tidyKindleEpub(epub, window.fflate);
+  item.bytes = tidy.bytes;
+  item.kind = 'epub';
+  item.fromKindle = true;
+  item.kindleNotes = [`Read from ${item.kindLabel} and rebuilt as EPUB${tidy.notes.length ? `; ${tidy.notes.join('; ')}` : ''}.`];
+}
+
+async function epubOf(item, o) {
+  if (item.kind === 'epub') return item.bytes;
+  const r = await convert(item, { ...o, to: 'epub' });
+  return new Uint8Array(await r.blob.arrayBuffer());
+}
 
 const KIND_LABEL = { docx: 'Word (.docx)', doc: 'Word 97-2003 (.doc)', odt: 'OpenDocument (.odt)', rtf: 'Rich Text (.rtf)', epub: 'EPUB e-book', html: 'HTML', markdown: 'Markdown', fb2: 'FictionBook (.fb2)', text: 'Plain text' };
 
@@ -156,12 +194,26 @@ function zipNames(bytes) {
   } catch {
     return null;
   }
+  let encryption = '';
   try {
-    const got = window.fflate.unzipSync(bytes, { filter: (f) => f.name === 'mimetype' && f.originalSize < 200 });
+    const want = (f) => (f.name === 'mimetype' && f.originalSize < 200) || (f.name === 'META-INF/encryption.xml' && f.originalSize < 4 << 20);
+    const got = window.fflate.unzipSync(bytes, { filter: want });
     if (got.mimetype) mimetype = new TextDecoder().decode(got.mimetype).trim();
+    if (got['META-INF/encryption.xml']) encryption = new TextDecoder().decode(got['META-INF/encryption.xml']);
   } catch {}
-  return { names, mimetype };
+  return { names, mimetype, encryption };
 }
+
+const FONT_OBFUSCATION = new Set(['http://www.idpf.org/2008/embedding', 'http://ns.adobe.com/pdf/enc#RC']);
+
+function epubDrm(z) {
+  if (z.names.includes('META-INF/rights.xml')) return true;
+  if (!z.encryption) return false;
+  const methods = [...z.encryption.matchAll(/<(?:\w+:)?EncryptionMethod\b[^>]*\bAlgorithm="([^"]+)"/g)].map((m) => m[1]);
+  return methods.some((a) => !FONT_OBFUSCATION.has(a));
+}
+
+const DRM_MESSAGE = 'this book is protected by DRM (copy protection), so it cannot be converted; this tool works with DRM-free books only';
 
 function detect(bytes, name) {
   const lower = name.toLowerCase();
@@ -182,7 +234,7 @@ function detect(bytes, name) {
     const has = (p) => z.names.some((n) => n === p || n.startsWith(p));
     if (has('word/')) return { kind: 'docx' };
     if (z.mimetype === 'application/vnd.oasis.opendocument.text' || (has('content.xml') && ext === 'odt')) return { kind: 'odt' };
-    if (z.mimetype === 'application/epub+zip' || has('META-INF/container.xml')) return { kind: 'epub' };
+    if (z.mimetype === 'application/epub+zip' || has('META-INF/container.xml')) return epubDrm(z) ? { error: DRM_MESSAGE } : { kind: 'epub' };
     if (has('xl/') || /spreadsheet/.test(z.mimetype)) return { error: 'this is a spreadsheet, not a text document' };
     if (has('ppt/') || /presentation/.test(z.mimetype)) return { error: 'this is a presentation, not a text document' };
     if (has('Index/') && z.names.some((n) => n.endsWith('.iwa'))) return { error: 'Apple Pages files are not supported; in Pages choose File > Export To > Word, then convert the .docx' };
@@ -193,9 +245,16 @@ function detect(bytes, name) {
   }
   if (b.length > 68) {
     const tag = String.fromCharCode(...b.subarray(60, 68));
-    if (tag === 'BOOKMOBI' || tag === 'TEXtREAd') return { error: 'Kindle MOBI and AZW books cannot be read by this converter yet' };
+    if (tag === 'BOOKMOBI' || tag === 'TEXtREAd') {
+      if (MODE !== 'ebook') return { error: 'this is a Kindle ebook; use the Ebook Converter (tools.katlab.dev/ebook-converter/) to convert it' };
+      return { kind: 'kindle', from: ext === 'azw3' ? 'azw3' : 'mobi', label: ext === 'azw3' ? 'Kindle AZW3' : ext === 'prc' || ext === 'pdb' ? 'Mobipocket' : ext === 'azw' ? 'Kindle AZW' : 'Kindle MOBI' };
+    }
   }
-  if ((b[0] === 0x43 && b[1] === 0x4f && b[2] === 0x4e && b[3] === 0x54) || (b[0] === 0xea && b[1] === 0x44 && b[2] === 0x52 && b[3] === 0x4d)) return { error: 'Kindle KFX books cannot be read by this converter yet' };
+  if (b[0] === 0xea && b[1] === 0x44 && b[2] === 0x52 && b[3] === 0x4d) return { error: DRM_MESSAGE };
+  if (b[0] === 0x43 && b[1] === 0x4f && b[2] === 0x4e && b[3] === 0x54) {
+    if (MODE !== 'ebook') return { error: 'this is a Kindle ebook; use the Ebook Converter (tools.katlab.dev/ebook-converter/) to convert it' };
+    return { kind: 'kindle', from: 'kfx', label: 'Kindle KFX' };
+  }
   if (b[0] === 0xff && b[1] === 0x57 && b[2] === 0x50 && b[3] === 0x43) return { error: 'WordPerfect documents are not supported; open the file in LibreOffice or WordPerfect and save it as .docx' };
   const head = new TextDecoder('utf-8', { fatal: false }).decode(b.subarray(0, 4096)).replace(/^﻿/, '');
   if (/^\s*\{\\rtf/.test(head) || (ext === 'rtf' && /^\s*\{/.test(head))) return { kind: 'rtf' };
@@ -519,6 +578,21 @@ async function convert(item, o) {
     }
     const html = await htmlPreview(item);
     res = { blob: new Blob([html], { type: 'text/html;charset=utf-8' }), name: `${name}.html`, preview: { kind: 'html', html } };
+  } else if (o.to === 'epub' && item.fromKindle) {
+    warnings.push(...item.kindleNotes);
+    res = { blob: new Blob([item.bytes], { type: OUT.epub.mime }), name: `${name}.epub`, preview: { kind: 'lazy' } };
+  } else if (o.to === 'kepub') {
+    const epub = await epubOf(item, o);
+    const out = await runEngine(kepubify, 'kepub', epub, {});
+    if (item.fromKindle) warnings.push(...item.kindleNotes);
+    warnings.push('Made with kepubify. Copy the .kepub.epub file to your Kobo over USB; Kobo uses it for faster page turns and reading statistics.');
+    res = { blob: new Blob([out], { type: OUT.kepub.mime }), name: `${name}.kepub.epub`, preview: { kind: 'lazy' } };
+  } else if (o.to === 'azw3') {
+    const epub = await epubOf(item, o);
+    const out = await runEngine(boko, 'boko', epub, { from: 'epub', to: 'azw3' });
+    if (item.fromKindle) warnings.push(...item.kindleNotes);
+    warnings.push('Experimental: AZW3 is for copying to a Kindle over USB. To send a book to your Kindle by email or the Send to Kindle app, use EPUB instead; Amazon converts it for you.');
+    res = { blob: new Blob([out], { type: OUT.azw3.mime }), name: `${name}.azw3`, preview: { kind: 'lazy' } };
   } else if (['docx', 'odt', 'epub', 'fb2'].includes(o.to)) {
     const target = o.to === 'epub' ? 'epub3' : o.to;
     const extra = o.to === 'epub' ? { 'metadata-files': ['katlab-meta.yaml'] } : o.to === 'fb2' ? { standalone: true } : {};
@@ -675,7 +749,7 @@ function render() {
 function rowFor(item) {
   const row = el('div', { className: `frow${item === selected ? ' sel' : ''}${item.error ? ' err' : ''}` });
   row.tabIndex = 0;
-  const info = el('div', { className: 'info' }, el('div', { className: 'n', textContent: item.name }), el('div', { className: 'sub2', textContent: item.error ? item.error : `${KIND_LABEL[item.kind] || ''} · ${fmtSize(item.bytes.length)}${item.status ? ` · ${item.status}` : ''}` }));
+  const info = el('div', { className: 'info' }, el('div', { className: 'n', textContent: item.name }), el('div', { className: 'sub2', textContent: item.error ? item.error : `${item.kindLabel || KIND_LABEL[item.kind] || ''} · ${fmtSize(item.bytes.length)}${item.status ? ` · ${item.status}` : ''}` }));
   row.append(info);
   if (item.result) {
     const btn = el('button', { className: 'btn small', type: 'button', textContent: `Download .${item.result.name.split('.').pop()}` });
@@ -737,7 +811,18 @@ async function showPreview() {
   const p = item.result.preview;
   if (p.kind === 'text') {
     previewEl.replaceChildren(el('pre', { className: 'text', textContent: p.text.length > 400000 ? `${p.text.slice(0, 400000)}\n\n…` : p.text }));
-  } else if (p.kind === 'html') {
+  } else if (p.kind === 'html' || p.kind === 'lazy') {
+    if (p.kind === 'lazy') {
+      previewEl.replaceChildren(el('div', { className: 'empty', textContent: 'Loading preview…' }));
+      try {
+        p.html = await htmlPreview(item);
+        p.kind = 'html';
+      } catch (e) {
+        if (my === previewSeq) previewEl.replaceChildren(el('div', { className: 'empty', textContent: `No preview available (${e.message}). The download is not affected.` }));
+        return;
+      }
+      if (my !== previewSeq) return;
+    }
     const frame = el('iframe', { className: 'doc', title: 'Document preview' });
     frame.setAttribute('sandbox', '');
     frame.setAttribute('referrerpolicy', 'no-referrer');
@@ -779,7 +864,9 @@ async function process(item) {
   render();
   if (item === selected) showPreview();
   try {
-    if (item.kind !== 'doc' || !['md', 'txt'].includes(o.to)) await ensureWorker();
+    await kindleToEpub(item);
+    const pandocFree = (item.kind === 'doc' && ['md', 'txt'].includes(o.to)) || (item.kind === 'epub' && (o.to === 'kepub' || o.to === 'azw3' || (o.to === 'epub' && item.fromKindle)));
+    if (!pandocFree) await ensureWorker();
     item.result = await convert(item, o);
     item.status = item.result.note || `→ ${OUT[o.to].label}, ${fmtSize(item.result.blob.size)}`;
   } catch (e) {
@@ -802,7 +889,7 @@ async function addFiles(files) {
   for (const f of files) {
     const bytes = new Uint8Array(await f.arrayBuffer());
     const d = detect(bytes, f.name);
-    const item = { id: nextId++, name: f.name, bytes, kind: d.kind || null, error: d.error || null, results: new Map(), result: null, status: d.error ? '' : 'queued' };
+    const item = { id: nextId++, name: f.name, bytes, kind: d.kind || null, from: d.from || null, kindLabel: d.label || null, error: d.error || null, results: new Map(), result: null, status: d.error ? '' : 'queued' };
     if (d.inner) {
       try {
         item.bytes = window.fflate.unzipSync(bytes, { filter: (x) => x.name === d.inner })[d.inner];

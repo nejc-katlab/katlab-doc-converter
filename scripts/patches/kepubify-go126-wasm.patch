@@ -1,0 +1,8 @@
+45c45
+< 	if !constructor("Array").Call("isArray", a).Bool() {
+---
+> 	if !constructor("Array").Call("isArray", js.Value(a)).Bool() {
+87c87
+< 	return Uint8Array(constructor("Uint8Array").New(a))
+---
+> 	return Uint8Array(constructor("Uint8Array").New(js.Value(a)))

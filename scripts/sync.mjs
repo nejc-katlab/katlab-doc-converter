@@ -14,6 +14,9 @@ await cp(path.join(root, 'licenses'), path.join(eng, 'licenses'), { recursive: t
 await cp(path.join(root, 'LICENSE'), path.join(eng, 'licenses', 'katlab-doc-converter-LICENSE'));
 await mkdir(path.join(site, 'assets', 'doc1'), { recursive: true });
 await cp(path.join(root, 'src', 'doc', 'doc-text.js'), path.join(site, 'assets', 'doc1', 'doc-text.js'));
+const ebook = path.join(site, 'assets', 'ebook1');
+await rm(ebook, { recursive: true, force: true });
+await cp(path.join(root, 'src', 'ebook'), ebook, { recursive: true });
 await mkdir(path.join(site, 'document-converter'), { recursive: true });
 await cp(path.join(root, 'src', 'page.js'), path.join(site, 'document-converter', 'page.js'));
 console.log(`synced into ${site}`);
