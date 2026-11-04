@@ -2,7 +2,8 @@ import { readDoc, docToMarkdown, docToText } from '/assets/doc1/doc-text.js?v=1'
 
 const $ = (id) => document.getElementById(id);
 const ENGINE = '/assets/pandoc313/';
-const STORE = 'katlab_docconv';
+const MODE = document.body.dataset.mode || 'docs';
+const STORE = MODE === 'ebook' ? 'katlab_ebookconv' : 'katlab_docconv';
 const listEl = $('files');
 const previewEl = $('preview');
 const engineEl = $('engine');
