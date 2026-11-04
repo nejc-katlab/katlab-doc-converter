@@ -1,4 +1,4 @@
-import {convertDocument, init} from "./engine.js"
+import {convertDocument, init} from "./engine.js?v=2"
 
 const progress = (loaded, total) => self.postMessage({type: "progress", loaded, total})
 

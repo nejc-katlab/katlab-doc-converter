@@ -22,10 +22,10 @@ const MIME = {
     woff: "font/woff"
 }
 
-const READERS = new Set(["docx", "odt", "rtf", "epub", "html", "markdown"])
-const WRITERS = new Set(["gfm", "html", "plain", "docx", "odt"])
-const BINARY = new Set(["docx", "odt"])
-const EXT = {docx: "docx", odt: "odt", rtf: "rtf", epub: "epub", html: "html", markdown: "md"}
+const READERS = new Set(["docx", "odt", "rtf", "epub", "html", "markdown", "fb2"])
+const WRITERS = new Set(["gfm", "html", "plain", "docx", "odt", "epub3", "fb2"])
+const BINARY = new Set(["docx", "odt", "epub3"])
+const EXT = {docx: "docx", odt: "odt", rtf: "rtf", epub: "epub", html: "html", markdown: "md", fb2: "fb2"}
 
 let ready = null
 let readyBase = null

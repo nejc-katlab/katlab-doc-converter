@@ -23,9 +23,11 @@ const OUT = {
   docx: { label: 'Word', ext: 'docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
   odt: { label: 'OpenDocument', ext: 'odt', mime: 'application/vnd.oasis.opendocument.text' },
   txt: { label: 'Plain text', ext: 'txt', mime: 'text/plain' },
+  epub: { label: 'EPUB', ext: 'epub', mime: 'application/epub+zip' },
+  fb2: { label: 'FictionBook', ext: 'fb2', mime: 'application/x-fictionbook+xml' },
 };
 
-const KIND_LABEL = { docx: 'Word (.docx)', doc: 'Word 97-2003 (.doc)', odt: 'OpenDocument (.odt)', rtf: 'Rich Text (.rtf)', epub: 'EPUB e-book', html: 'HTML', markdown: 'Markdown' };
+const KIND_LABEL = { docx: 'Word (.docx)', doc: 'Word 97-2003 (.doc)', odt: 'OpenDocument (.odt)', rtf: 'Rich Text (.rtf)', epub: 'EPUB e-book', html: 'HTML', markdown: 'Markdown', fb2: 'FictionBook (.fb2)', text: 'Plain text' };
 
 function fmtSize(n) {
   if (n < 1024) return `${n} B`;
@@ -64,7 +66,7 @@ function syncOptionRows() {
 
 function ensureWorker() {
   if (worker) return engine;
-  worker = new Worker(`${ENGINE}worker.js`, { type: 'module' });
+  worker = new Worker(`${ENGINE}worker.js?v=2`, { type: 'module' });
   engine = new Promise((resolve, reject) => {
     worker.onmessage = (ev) => {
       const m = ev.data;
@@ -183,19 +185,29 @@ function detect(bytes, name) {
     if (has('xl/') || /spreadsheet/.test(z.mimetype)) return { error: 'this is a spreadsheet, not a text document' };
     if (has('ppt/') || /presentation/.test(z.mimetype)) return { error: 'this is a presentation, not a text document' };
     if (has('Index/') && z.names.some((n) => n.endsWith('.iwa'))) return { error: 'Apple Pages files are not supported; in Pages choose File > Export To > Word, then convert the .docx' };
+    const fb2 = z.names.find((n) => /\.fb2$/i.test(n));
+    if (fb2) return { kind: 'fb2', inner: fb2 };
+    if (z.names.some((n) => /\.(jpe?g|png|gif|webp)$/i.test(n)) && /^(cbz|zip)$/.test(ext)) return { error: 'this is a comic or image archive, not a text document' };
     return { error: 'this ZIP file is not a document' };
   }
+  if (b.length > 68) {
+    const tag = String.fromCharCode(...b.subarray(60, 68));
+    if (tag === 'BOOKMOBI' || tag === 'TEXtREAd') return { error: 'Kindle MOBI and AZW books cannot be read by this converter yet' };
+  }
+  if ((b[0] === 0x43 && b[1] === 0x4f && b[2] === 0x4e && b[3] === 0x54) || (b[0] === 0xea && b[1] === 0x44 && b[2] === 0x52 && b[3] === 0x4d)) return { error: 'Kindle KFX books cannot be read by this converter yet' };
   if (b[0] === 0xff && b[1] === 0x57 && b[2] === 0x50 && b[3] === 0x43) return { error: 'WordPerfect documents are not supported; open the file in LibreOffice or WordPerfect and save it as .docx' };
   const head = new TextDecoder('utf-8', { fatal: false }).decode(b.subarray(0, 4096)).replace(/^﻿/, '');
   if (/^\s*\{\\rtf/.test(head) || (ext === 'rtf' && /^\s*\{/.test(head))) return { kind: 'rtf' };
   if (/^\s*(<!doctype html|<html|<\?xml[^>]*>\s*<html)/i.test(head) || ['html', 'htm', 'xhtml'].includes(ext)) return { kind: 'html' };
-  if (['md', 'markdown', 'mdown', 'txt'].includes(ext)) return { kind: 'markdown' };
+  if (/<FictionBook[\s>]/.test(head)) return { kind: 'fb2' };
+  if (['md', 'markdown', 'mdown'].includes(ext)) return { kind: 'markdown' };
+  if (ext === 'txt' || ext === 'text' || !ext) return { kind: 'text' };
   if (ext === 'pages') return { error: 'Apple Pages files are not supported; in Pages choose File > Export To > Word, then convert the .docx' };
   return { error: 'this file type is not supported' };
 }
 
 function base(name) {
-  return (name.replace(/\.[^.]+$/, '') || 'document').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 120);
+  return (name.replace(/\.[^.]+$/, '').replace(/\.(fb2|kepub)$/i, '') || 'document').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 120);
 }
 
 function normPath(p) {
@@ -380,7 +392,7 @@ async function source(item) {
     item.src = { md, text: docToText(r), media: [], title: r.meta?.title || '', warnings: ['Old Word 97-2003 file: the text, headings and tables were recovered, but formatting, images, list numbering and footnotes were not. For a full conversion, open it in Word or LibreOffice, save it as .docx, and convert that.', ...r.warnings.slice(0, 3)] };
     return item.src;
   }
-  const r = await pandoc(item.bytes.buffer.slice(item.bytes.byteOffset, item.bytes.byteOffset + item.bytes.byteLength), item.kind, 'gfm', { to: 'gfm' });
+  const r = await pandoc(...pin(item), 'gfm', { to: 'gfm' });
   const media = r.media.map((m) => ({ ...m, path: safePath(m.path), bytes: new Uint8Array(m.data) }));
   item.src = { md: tidyMarkdown(r.output), media, warnings: [...mediaWarnings(media), ...r.warnings.filter(usefulWarning).slice(0, 4)] };
   return item.src;
@@ -394,13 +406,70 @@ function inputBuffer(item) {
   return item.bytes.buffer.slice(item.bytes.byteOffset, item.bytes.byteOffset + item.bytes.byteLength);
 }
 
+function pin(item) {
+  if (item.kind === 'text') return [item.textMd, 'markdown'];
+  return [inputBuffer(item), item.kind];
+}
+
+function decodeText(bytes) {
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return { text: new TextDecoder('utf-16le').decode(bytes.subarray(2)), enc: 'UTF-16' };
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) return { text: new TextDecoder('utf-16be').decode(bytes.subarray(2)), enc: 'UTF-16' };
+  try {
+    return { text: new TextDecoder('utf-8', { fatal: true }).decode(bytes).replace(/^\ufeff/, ''), enc: 'UTF-8' };
+  } catch {
+    const count = (s, re) => (s.match(re) || []).length;
+    const w1252 = new TextDecoder('windows-1252').decode(bytes);
+    const w1250 = new TextDecoder('windows-1250').decode(bytes);
+    const w1251 = new TextDecoder('windows-1251').decode(bytes);
+    const s1252 = count(w1252, /[\u00e0\u00e1\u00e2\u00e4\u00e7\u00e8\u00e9\u00ea\u00eb\u00ec\u00ed\u00ee\u00ef\u00f1\u00f2\u00f3\u00f4\u00f6\u00f9\u00fa\u00fb\u00fc\u00ff\u00e6\u00f8\u00e5\u00c0\u00c1\u00c2\u00c4\u00c7\u00c8\u00c9\u00ca\u00cb\u00cc\u00cd\u00ce\u00cf\u00d1\u00d2\u00d3\u00d4\u00d6\u00d9\u00da\u00db\u00dc\u00c6\u00d8\u00c5\u00df]/g);
+    const s1250 = count(w1250, /[\u010d\u0107\u017e\u0161\u0111\u0159\u011b\u0142\u0151\u0171\u0105\u0119\u015b\u017a\u0148\u0165\u010f\u013e\u013a\u0155\u016f\u010c\u0106\u017d\u0160\u0110\u0158\u011a\u0141\u0150\u0170\u0104\u0118\u015a\u0179\u0147\u0164\u010e\u013d\u0139\u0154\u016e]/g);
+    const s1251 = count(w1251, /[\u0430-\u044f\u0410-\u042f\u0451\u0401]/g);
+    if (s1251 > 2 * Math.max(s1250, s1252, 1)) return { text: w1251, enc: 'Windows-1251 (Cyrillic)' };
+    if (s1250 > s1252) return { text: w1250, enc: 'Windows-1250 (Central European)' };
+    return { text: w1252, enc: 'Windows-1252 (Western)' };
+  }
+}
+
+const CHAPTER = /^(chapter|part|book|section|volume|prologue|epilogue|preface|introduction|afterword|appendix|kapitel|teil|poglavje|del|capítulo|capitulo|chapitre|partie|capitolo|parte|hoofdstuk|rozdział|глава|часть)\b/i;
+
+function mdEscapeLine(s) {
+  return s.replace(/([\\`*_[\]<>])/g, '\\$1').replace(/^(\s*)([#>+-]|\d+[.)])(\s)/, '$1\\$2$3').replace(/^(\s*)([=-]{3,})\s*$/, '$1\\$2');
+}
+
+function textToMarkdown(text) {
+  const norm = text.replace(/\r\n?/g, '\n').replace(/\t/g, '    ');
+  const lines = norm.split('\n');
+  const hasBlank = lines.some((l, i) => i > 0 && i < lines.length - 1 && !l.trim());
+  const paras = hasBlank ? norm.split(/\n\s*\n+/) : lines;
+  let chapters = 0;
+  const out = [];
+  for (const raw of paras) {
+    const p = raw.trim();
+    if (!p) continue;
+    const single = !p.includes('\n');
+    const caps = single && p.length < 60 && /[A-ZÀ-ÞА-Я]/.test(p) && p === p.toUpperCase() && /[A-ZÀ-ÞА-Я]{3}/.test(p);
+    const roman = single && /^[IVXLC]+\.?$/.test(p);
+    if (single && p.length < 80 && (CHAPTER.test(p) || caps || roman)) {
+      chapters++;
+      out.push(`# ${mdEscapeLine(p)}`);
+      continue;
+    }
+    out.push(p.split('\n').map((l) => mdEscapeLine(l.trim())).filter(Boolean).join(hasBlank ? ' ' : '\n'));
+  }
+  return { md: out.join('\n\n'), chapters };
+}
+
+function metaResource(title) {
+  return [{ path: 'katlab-meta.yaml', data: new TextEncoder().encode(`title: ${JSON.stringify(title)}\nlang: ${JSON.stringify(document.documentElement.lang || 'en')}\n`).buffer }];
+}
+
 async function htmlPreview(item) {
   if (item.previewHtml) return item.previewHtml;
   let html;
   if (item.kind === 'doc') {
     const s = await source(item);
     html = (await pandoc(s.md, 'markdown', 'html')).output;
-  } else html = (await pandoc(inputBuffer(item), item.kind, 'html')).output;
+  } else html = (await pandoc(...pin(item), 'html')).output;
   item.previewHtml = html;
   return html;
 }
@@ -439,7 +508,7 @@ async function convert(item, o) {
       const s = await source(item);
       warnings.push(...s.warnings.slice(0, 1));
       text = s.text;
-    } else text = (await pandoc(inputBuffer(item), item.kind, 'plain')).output;
+    } else text = (await pandoc(...pin(item), 'plain')).output;
     res = { blob: new Blob([text], { type: 'text/plain;charset=utf-8' }), name: `${name}.txt`, preview: { kind: 'text', text } };
   } else if (o.to === 'html') {
     if (item.kind === 'doc') warnings.push(...(await source(item)).warnings.slice(0, 1));
@@ -449,18 +518,23 @@ async function convert(item, o) {
     }
     const html = await htmlPreview(item);
     res = { blob: new Blob([html], { type: 'text/html;charset=utf-8' }), name: `${name}.html`, preview: { kind: 'html', html } };
-  } else if (o.to === 'docx' || o.to === 'odt') {
+  } else if (['docx', 'odt', 'epub', 'fb2'].includes(o.to)) {
+    const target = o.to === 'epub' ? 'epub3' : o.to;
+    const extra = o.to === 'epub' ? { 'metadata-files': ['katlab-meta.yaml'] } : o.to === 'fb2' ? { standalone: true } : {};
+    const res0 = o.to === 'epub' ? metaResource(name) : [];
     let r;
     if (item.kind === 'doc') {
       const s = await source(item);
       warnings.push(...s.warnings.slice(0, 1));
-      r = await pandoc(s.md, 'markdown', o.to);
+      r = await pandoc(s.md, 'markdown', target, extra, res0);
     } else {
       const s = await source(item).catch(() => null);
       if (s) warnings.push(...s.warnings.filter((w) => /Windows format/.test(w)));
-      r = await pandoc(inputBuffer(item), item.kind, o.to);
+      r = await pandoc(...pin(item), target, extra, res0);
     }
     if (item.kind === o.to) warnings.push(`This is already ${OUT[o.to].label} format; the file was rewritten in a clean, standard form.`);
+    if (item.kind === 'text') warnings.push(...item.textNotes);
+    if (o.to === 'fb2') warnings.push('FictionBook has no real lists or tables, so those are written as plain paragraphs.');
     res = { blob: new Blob([r.output], { type: OUT[o.to].mime }), name: `${name}.${o.to}`, preview: { kind: 'html', html: await htmlPreview(item) } };
   } else if (o.to === 'pdf') {
     const s = await source(item);
@@ -728,6 +802,20 @@ async function addFiles(files) {
     const bytes = new Uint8Array(await f.arrayBuffer());
     const d = detect(bytes, f.name);
     const item = { id: nextId++, name: f.name, bytes, kind: d.kind || null, error: d.error || null, results: new Map(), result: null, status: d.error ? '' : 'queued' };
+    if (d.inner) {
+      try {
+        item.bytes = window.fflate.unzipSync(bytes, { filter: (x) => x.name === d.inner })[d.inner];
+      } catch {
+        item.error = 'the FictionBook ZIP is damaged';
+      }
+    }
+    if (item.kind === 'text') {
+      const { text, enc } = decodeText(bytes);
+      const { md, chapters } = textToMarkdown(text);
+      item.textMd = md;
+      item.textNotes = [`Plain text read as ${enc}${chapters ? `, with ${chapters} chapter heading${chapters === 1 ? '' : 's'} detected` : '; no chapter headings were detected, so it is one long section'}.`];
+      if (!md.trim()) item.error = 'the text file is empty';
+    }
     items.push(item);
     if (!item.error) added.push(item);
   }
